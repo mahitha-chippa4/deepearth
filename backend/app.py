@@ -9,6 +9,7 @@ import numpy as np
 from datetime import datetime
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from typing import Optional, List
 
@@ -292,3 +293,88 @@ def _encode_prediction_image(pred_map: np.ndarray) -> str:
         return base64.b64encode(buffer.getvalue()).decode("utf-8")
     except ImportError:
         return ""
+
+
+# ── Explainability ─────────────────────────────────────────────
+
+class ExplainRequest(BaseModel):
+    lat:         float
+    lon:         float
+    bbox_size:   float = 0.3
+    region_name: str   = "Unknown"
+    geometry:    Optional[dict] = None
+
+@app.post("/explain")
+async def explain_prediction(req: ExplainRequest):
+    """
+    Generate a Grad-CAM explanation heatmap for the most recent prediction.
+    This runs AFTER prediction and does NOT modify the prediction pipeline.
+    """
+    if predictor is None:
+        raise HTTPException(500, "Models not loaded")
+    try:
+        from .satellite_fetcher import fetch_static_features  # already imported above
+        geom = req.geometry or {
+            "type": "Polygon",
+            "coordinates": [[
+                [req.lon - req.bbox_size, req.lat - req.bbox_size],
+                [req.lon + req.bbox_size, req.lat - req.bbox_size],
+                [req.lon + req.bbox_size, req.lat + req.bbox_size],
+                [req.lon - req.bbox_size, req.lat + req.bbox_size],
+                [req.lon - req.bbox_size, req.lat - req.bbox_size],
+            ]],
+        }
+        features = fetch_static_features(req.lat, req.lon, geometry=geom)
+        explanation_map = predictor.generate_explanation(features)
+        return {
+            "success": True,
+            "region": req.region_name,
+            "explanation_map": explanation_map,
+            "timestamp": datetime.now().isoformat(),
+        }
+    except Exception as e:
+        raise HTTPException(500, f"Explanation failed: {str(e)}")
+
+
+# ── Report Generation ──────────────────────────────────────────
+
+class ReportRequest(BaseModel):
+    region_name:         str
+    lat:                 float
+    lon:                 float
+    stats:               dict
+    timestamp:           Optional[str] = None
+    prediction_image:    Optional[str] = None   # base64 PNG
+    explanation_map:     Optional[str] = None   # base64 PNG
+
+@app.post("/generate-report")
+async def generate_report(req: ReportRequest):
+    """
+    Generate and return a downloadable PDF environmental analysis report.
+    """
+    try:
+        from .report_generator import generate_report as _gen
+        pdf_bytes = _gen(
+            region_name         = req.region_name,
+            lat                 = req.lat,
+            lon                 = req.lon,
+            stats               = req.stats,
+            timestamp           = req.timestamp,
+            prediction_image_b64= req.prediction_image,
+            explanation_map_b64 = req.explanation_map,
+        )
+        # Sanitise filename
+        safe_name = req.region_name.split(",")[0].strip().lower()
+        safe_name = "".join(c if c.isalnum() else "_" for c in safe_name)
+        date_str  = datetime.now().strftime("%Y")
+        filename  = f"deepearth_report_{safe_name}_{date_str}.pdf"
+
+        return StreamingResponse(
+            io.BytesIO(pdf_bytes),
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+            },
+        )
+    except Exception as e:
+        raise HTTPException(500, f"Report generation failed: {str(e)}")

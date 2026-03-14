@@ -38,13 +38,17 @@ const INDIAN_REGIONS = [
 
 const PREDICTION_SOURCE = 'ai-prediction-src';
 const PREDICTION_LAYER = 'ai-prediction-layer';
+const GRADCAM_SOURCE = 'gradcam-src';
+const GRADCAM_LAYER  = 'gradcam-layer';
 
 export default function MapViewer({
   onRegionClick,
   layers,
   onViewerReady,
-  predictionOverlay,       // { imageUrl, bbox: {west,south,east,north} } | null
-  showPredictionLayer,     // boolean toggle
+  predictionOverlay,
+  showPredictionLayer,
+  gradcamOverlay,       // { imageUrl, bbox } | null
+  showGradcam,         // boolean
 }) {
   const containerRef = useRef(null);
   const mapRef = useRef(null);
@@ -221,6 +225,42 @@ export default function MapViewer({
       });
     }
   }, [predictionOverlay, showPredictionLayer]);
+
+  // ── Grad-CAM Explanation Overlay ────────────────────────────────────────
+  // Sits ABOVE the prediction layer at 0.4 opacity with 500ms fade.
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !map.isStyleLoaded?.()) return;
+
+    try { if (map.getLayer(GRADCAM_LAYER))  map.removeLayer(GRADCAM_LAYER);  } catch (_) {}
+    try { if (map.getSource(GRADCAM_SOURCE)) map.removeSource(GRADCAM_SOURCE); } catch (_) {}
+
+    if (gradcamOverlay && showGradcam) {
+      const { imageUrl, bbox } = gradcamOverlay;
+      if (!imageUrl || !bbox) return;
+
+      map.addSource(GRADCAM_SOURCE, {
+        type: 'image',
+        url: imageUrl,
+        coordinates: [
+          [bbox.west, bbox.north],
+          [bbox.east, bbox.north],
+          [bbox.east, bbox.south],
+          [bbox.west, bbox.south],
+        ],
+      });
+
+      map.addLayer({
+        id: GRADCAM_LAYER,
+        type: 'raster',
+        source: GRADCAM_SOURCE,
+        paint: {
+          'raster-opacity': 0.4,
+          'raster-fade-duration': 500,   // 500ms fade-in
+        },
+      });
+    }
+  }, [gradcamOverlay, showGradcam]);
 
   return (
     <div

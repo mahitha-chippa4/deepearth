@@ -84,6 +84,10 @@ export default function App() {
   const [predictionOverlay, setPredictionOverlay] = useState(null);
   const [showPredictionLayer, setShowPredictionLayer] = useState(true);
 
+  // Grad-CAM explanation overlay state
+  const [gradcamOverlay, setGradcamOverlay] = useState(null);
+  const [showGradcam, setShowGradcam] = useState(false);
+
   // Cache: skip re-analysis if same region is clicked again
   const lastAnalyzedRef = useRef(null);
 
@@ -197,14 +201,25 @@ export default function App() {
   const handleToggleLayer = useCallback((layerKey) => {
     if (layerKey === 'prediction') {
       setShowPredictionLayer(prev => !prev);
+    } else if (layerKey === 'gradcam') {
+      setShowGradcam(prev => !prev);
     } else {
       setLayers(prev => ({ ...prev, [layerKey]: !prev[layerKey] }));
     }
   }, []);
 
+  // Called by AnalysisResults when Explain AI returns a heatmap image URL
+  const handleExplain = useCallback((imageUrl) => {
+    if (!predictionOverlay?.bbox) return;
+    setGradcamOverlay({ imageUrl, bbox: predictionOverlay.bbox });
+    setShowGradcam(true);
+  }, [predictionOverlay]);
+
   const handleClearOverlay = useCallback(() => {
     setPredictionOverlay(null);
     setShowPredictionLayer(false);
+    setGradcamOverlay(null);
+    setShowGradcam(false);
     setAnalysisResults(null);
     lastAnalyzedRef.current = null;
   }, []);
@@ -231,6 +246,8 @@ export default function App() {
             onViewerReady={setViewerRef}
             predictionOverlay={predictionOverlay}
             showPredictionLayer={showPredictionLayer}
+            gradcamOverlay={gradcamOverlay}
+            showGradcam={showGradcam}
           />
 
           {/* Analysis Panel */}
@@ -256,6 +273,9 @@ export default function App() {
             <AnalysisResults
               results={analysisResults}
               onClose={handleClearOverlay}
+              onExplain={handleExplain}
+              showExplanation={showGradcam}
+              onToggleExplanation={() => setShowGradcam(p => !p)}
             />
           )}
 

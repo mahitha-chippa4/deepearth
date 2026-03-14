@@ -2,7 +2,7 @@
 DeepEarth V2 — Inference Pipeline
 Handles model loading, patch-based prediction, and post-processing.
 """
-
+from .explainability import generate_gradcam
 import os
 import numpy as np
 import torch
@@ -159,3 +159,77 @@ class DeepEarthPredictor:
             smoothed_binary = ndimage.uniform_filter(binary, size=window)
             smoothed[smoothed_binary > 0.3] = cls
         return smoothed
+
+    def generate_explanation(self, features: np.ndarray) -> str:
+        """
+        Generate a Grad-CAM explanation heatmap for the UNetV3 model.
+
+        This runs AFTER prediction — it does NOT modify the prediction pipeline.
+        Uses a single centre patch from the feature array (fast, representative).
+
+        Args:
+            features: (H, W, 12) feature array — same input as predict_static
+
+        Returns:
+            base64-encoded PNG string of the JET-coloured heatmap,
+            or "" if Grad-CAM fails (prediction is never affected).
+        """
+        try:
+            from .explainability import generate_gradcam, encode_heatmap
+
+            H, W, C = features.shape
+            # Pick a representative centre patch
+            ci = max(0, H // 2 - PATCH_SIZE // 2)
+            cj = max(0, W // 2 - PATCH_SIZE // 2)
+            patch = features[ci: ci + PATCH_SIZE, cj: cj + PATCH_SIZE, :]
+            if patch.shape[:2] != (PATCH_SIZE, PATCH_SIZE):
+                patch = np.pad(
+                    patch,
+                    [(0, PATCH_SIZE - patch.shape[0]),
+                     (0, PATCH_SIZE - patch.shape[1]),
+                     (0, 0)],
+                )
+
+            # (H, W, C) → (1, C, H, W)
+            t = (
+                torch.tensor(patch, dtype=torch.float32)
+                .permute(2, 0, 1)
+                .unsqueeze(0)
+                .to(self.device)
+            )
+
+            # 1) Run prediction on the same patch (separate, no pipeline change)
+            #    to get a mask of where environmental change was detected.
+            with torch.no_grad():
+                out = self.unet(t)
+                pred = torch.argmax(out, dim=1).squeeze()  # (H, W)
+            # Mask: 1.0 where the model predicts change (class != 0), 0 otherwise
+            prediction_mask = (pred != 0).float().cpu().numpy()  # (H, W)
+
+            # 2) Generate Grad-CAM — requires grad, so use a fresh tensor
+            t_grad = t.detach().clone().requires_grad_(True)
+
+            # Target the last encoder block of UNetV3
+            target_layer = getattr(self.unet, "enc4", None) \
+                        or getattr(self.unet, "encoder4", None) \
+                        or list(self.unet.children())[-2]
+
+            heatmap = generate_gradcam(self.unet, t_grad, target_layer)
+
+            # 3) Mask the heatmap: only show explanations in change regions
+            if heatmap is not None:
+                heatmap = heatmap * prediction_mask
+                # Re-normalise to [0, 1] after masking
+                hmax = heatmap.max()
+                if hmax > 0:
+                    heatmap = heatmap / hmax
+
+            return encode_heatmap(heatmap)
+
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning(
+                "generate_explanation failed (prediction unaffected): %s", exc
+            )
+            return ""
+
