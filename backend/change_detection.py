@@ -63,28 +63,50 @@ def compare_predictions(
 
 def compute_alert_score(pred_map: np.ndarray) -> float:
     """
-    Compute weighted alert score from a prediction map.
-    Higher score = more environmental concern.
+    Compute environmental alert score using dominant-change formula.
+    Score is 0–100 based on the most impactful detected change.
     """
     total = pred_map.size
-    score = 0.0
-    for cls in range(NUM_CLASSES):
-        pct = 100 * (pred_map == cls).sum() / total
-        score += ALERT_WEIGHTS[cls] * pct
-    return score
+    if total == 0:
+        return 0.0
+
+    def pct(cls_id):
+        return float(100 * (pred_map == cls_id).sum() / total)
+
+    # Combine related classes into categories
+    forest_degradation     = pct(2) + pct(3)           # Deforestation + Degradation
+    mining_activity        = pct(6) + pct(7)           # Mining + Sand Mining
+    agricultural_expansion = pct(10)                    # Agricultural Expansion
+    urban_expansion        = pct(4) + pct(5)           # Urban + Industrial
+    temp_veg_loss          = pct(1)                     # Temporary Vegetation Loss
+
+    # Dominant detected change drives the score
+    dominant_change = max(
+        forest_degradation,
+        mining_activity,
+        agricultural_expansion,
+        urban_expansion,
+        temp_veg_loss,
+    )
+
+    risk_score = (
+        0.60 * dominant_change +
+        0.25 * forest_degradation +
+        0.15 * mining_activity
+    )
+
+    return max(0.0, min(100.0, risk_score))
 
 
 def classify_severity(score: float) -> str:
-    """Classify alert severity from score."""
-    if score >= 80:
+    """Classify alert level from 0–100 score."""
+    if score >= 60:
         return "CRITICAL"
-    elif score >= 40:
+    elif score >= 35:
         return "HIGH"
     elif score >= 15:
-        return "MEDIUM"
-    elif score >= 3:
-        return "LOW"
-    return "CLEAR"
+        return "MODERATE"
+    return "LOW"
 
 
 def compute_region_stats(pred_map: np.ndarray) -> dict:

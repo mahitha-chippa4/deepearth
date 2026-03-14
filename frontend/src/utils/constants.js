@@ -12,22 +12,22 @@ export const CLASS_COLORS = [
 
 export const SEVERITY_CONFIG = {
   CRITICAL: { icon: '🔴', color: '#e74c3c', bg: '#fdecea' },
-  HIGH:     { icon: '🟠', color: '#e67e22', bg: '#fef5e7' },
-  MEDIUM:   { icon: '🟡', color: '#f1c40f', bg: '#fef9e7' },
-  LOW:      { icon: '🟢', color: '#2ecc71', bg: '#eafaf1' },
-  CLEAR:    { icon: '✅', color: '#27ae60', bg: '#eafaf1' },
+  HIGH: { icon: '🟠', color: '#e67e22', bg: '#fef5e7' },
+  MEDIUM: { icon: '🟡', color: '#f1c40f', bg: '#fef9e7' },
+  LOW: { icon: '🟢', color: '#2ecc71', bg: '#eafaf1' },
+  CLEAR: { icon: '✅', color: '#27ae60', bg: '#eafaf1' },
 };
 
 export const SIDEBAR_ITEMS = [
   { id: 'forest-change', label: 'FOREST CHANGE', icon: '🌲', hasNotif: true },
-  { id: 'land-cover',    label: 'LAND COVER',    icon: '🗺️', hasNotif: true },
-  { id: 'land-use',      label: 'LAND USE',      icon: '🏗️' },
-  { id: 'climate',       label: 'CLIMATE',       icon: '🌡️' },
-  { id: 'biodiversity',  label: 'BIODIVERSITY',  icon: '🌿' },
+  { id: 'land-cover', label: 'LAND COVER', icon: '🗺️', hasNotif: true },
+  { id: 'land-use', label: 'LAND USE', icon: '🏗️' },
+  { id: 'climate', label: 'CLIMATE', icon: '🌡️' },
+  { id: 'biodiversity', label: 'BIODIVERSITY', icon: '🌿' },
 ];
 
 export const SIDEBAR_BOTTOM = [
   { id: 'explore', label: 'EXPLORE', icon: '🔭' },
-  { id: 'search',  label: 'SEARCH',  icon: '🔍' },
-  { id: 'my-gfw',  label: 'MY GFW',  icon: '⭐' },
+  { id: 'search', label: 'SEARCH', icon: '🔍' },
+  { id: 'my-gfw', label: 'MY GFW', icon: '⭐' },
 ];

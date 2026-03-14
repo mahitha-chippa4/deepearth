@@ -119,9 +119,9 @@ export default function App() {
 
     const bboxSize = 0.3;   // fixed 0.3° window around each click
     const bbox = {
-      west:  clickLon - bboxSize,
+      west: clickLon - bboxSize,
       south: clickLat - bboxSize,
-      east:  clickLon + bboxSize,
+      east: clickLon + bboxSize,
       north: clickLat + bboxSize,
     };
 

@@ -15,6 +15,39 @@ export default function AnalysisResults({
   const [explaining, setExplaining] = useState(false);
   const [downloading, setDownloading] = useState(false);
   const [explainError, setExplainError] = useState(null);
+  const [sendingEmail, setSendingEmail] = useState(false);
+  const [emailSent, setEmailSent] = useState(false);
+
+  // ── Send Gmail Alert ──────────────────────────────────────────────────
+  const handleSendAlert = async () => {
+    if (sendingEmail || emailSent) return;
+    setSendingEmail(true);
+    try {
+      const lat = results.lat ?? ((bbox.north + bbox.south) / 2);
+      const lon = results.lon ?? ((bbox.east + bbox.west) / 2);
+      const resp = await fetch(`${API_BASE}/send-alert-email`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          region_name: region,
+          latitude: lat,
+          longitude: lon,
+          alert_level: stats.severity,
+          risk_score: stats.alert_score,
+          forest_loss: stats.forest_loss_pct || 0,
+          urban_growth: stats.urban_growth_pct || 0,
+          top_issues: (stats.top_issues || []).map(i => i.class_name),
+        }),
+      });
+      if (!resp.ok) throw new Error(`Server ${resp.status}`);
+      setEmailSent(true);
+    } catch (err) {
+      console.error('Email alert failed:', err);
+      alert('Failed to send email alert. Please check backend configuration.');
+    } finally {
+      setSendingEmail(false);
+    }
+  };
 
   // ── Explain AI — call /explain then hand image URL to parent ──────────
   const handleExplain = async () => {
@@ -24,7 +57,7 @@ export default function AnalysisResults({
     try {
       // Derive lat/lon from bbox centre (robust when clickLat not in results)
       const lat = results.lat ?? ((bbox.north + bbox.south) / 2);
-      const lon = results.lon ?? ((bbox.east  + bbox.west)  / 2);
+      const lon = results.lon ?? ((bbox.east + bbox.west) / 2);
       const resp = await fetch(`${API_BASE}/explain`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -51,28 +84,28 @@ export default function AnalysisResults({
     setDownloading(true);
     try {
       const lat = results.lat ?? ((bbox.north + bbox.south) / 2);
-      const lon = results.lon ?? ((bbox.east  + bbox.west)  / 2);
+      const lon = results.lon ?? ((bbox.east + bbox.west) / 2);
       const resp = await fetch(`${API_BASE}/generate-report`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          region_name:      region,
+          region_name: region,
           lat,
           lon,
           stats,
           timestamp,
           prediction_image: results.prediction_image || null,
-          explanation_map:  results.explanation_map  || null,
+          explanation_map: results.explanation_map || null,
         }),
       });
       if (!resp.ok) throw new Error(`Server ${resp.status}`);
       const blob = await resp.blob();
-      const url  = URL.createObjectURL(blob);
-      const a    = document.createElement('a');
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
       // File name: deepearth_report_<region>_<date>.pdf
       const safeName = region.split(',')[0].trim().toLowerCase().replace(/\s+/g, '_');
-      const year     = new Date().getFullYear();
-      a.href     = url;
+      const year = new Date().getFullYear();
+      a.href = url;
       a.download = `deepearth_report_${safeName}_${year}.pdf`;
       a.click();
       URL.revokeObjectURL(url);
@@ -122,7 +155,7 @@ export default function AnalysisResults({
 
         {/* Key Metrics */}
         <div className="px-4 py-3 grid grid-cols-2 gap-2">
-          <MetricCard label="Forest Loss"  value={`${stats.forest_loss_pct}%`}  color="#e74c3c" />
+          <MetricCard label="Forest Loss" value={`${stats.forest_loss_pct}%`} color="#e74c3c" />
           <MetricCard label="Urban Growth" value={`${stats.urban_growth_pct}%`} color="#9b59b6" />
         </div>
 
@@ -237,6 +270,34 @@ export default function AnalysisResults({
               <>🧠 Explain AI</>
             )}
           </button>
+
+          {/* Gmail Alert — only for HIGH / CRITICAL */}
+          {(stats.severity === 'HIGH' || stats.severity === 'CRITICAL') && (
+            <button
+              id="btn-send-alert"
+              onClick={handleSendAlert}
+              disabled={sendingEmail}
+              className={`w-full py-2 text-xs font-bold rounded tracking-wider uppercase transition-all flex items-center justify-center gap-1.5
+                ${emailSent
+                  ? 'bg-green-100 text-green-700 border border-green-300'
+                  : 'bg-red-600 hover:bg-red-700 text-white'
+                } disabled:opacity-50`}
+            >
+              {sendingEmail ? (
+                <>
+                  <svg className="w-3.5 h-3.5 animate-spin" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
+                    <circle cx="12" cy="12" r="10" strokeOpacity="0.25" />
+                    <path d="M12 2a10 10 0 0 1 10 10" strokeLinecap="round" />
+                  </svg>
+                  Sending…
+                </>
+              ) : emailSent ? (
+                <>✅ Email Alert Sent</>
+              ) : (
+                <>📧 Send Gmail Alert</>
+              )}
+            </button>
+          )}
 
           <div className="flex gap-2">
             <button
