@@ -93,54 +93,53 @@ export default function App() {
   }, []);
 
   const handleAnalyze = useCallback(async (region) => {
-    // Cache check — skip re-computation if same region
-    const regionKey = `${region.lat}_${region.lon}`;
+    // Use the EXACT click coordinates — not the region centroid.
+    // This ensures different clicks within the same state produce different predictions
+    // because the backend fetches satellite data for the exact location.
+    const clickLat = +(region.clickLat ?? region.lat);
+    const clickLon = +(region.clickLon ?? region.lon);
+
+    // Cache key based on exact click coordinates (5 decimal places ≈ 1m precision)
+    const regionKey = `${clickLat.toFixed(5)}_${clickLon.toFixed(5)}`;
     if (lastAnalyzedRef.current?.key === regionKey) {
       setAnalysisResults(lastAnalyzedRef.current.results);
       setPredictionOverlay(lastAnalyzedRef.current.overlay);
       setShowPredictionLayer(true);
       setSelectedRegion(null);
-      // Auto-zoom to the region
-      viewerRef?.flyTo?.([region.lon, region.lat], 8);
+      viewerRef?.flyTo?.([clickLon, clickLat], 10);
       return;
     }
 
     setIsAnalyzing(true);
     setSelectedRegion(null);
 
-    const bboxSize = region.bbox || 0.3;
+    const bboxSize = 0.3;   // fixed 0.3° window around each click
     const bbox = {
-      west: region.lon - bboxSize,
-      south: region.lat - bboxSize,
-      east: region.lon + bboxSize,
-      north: region.lat + bboxSize,
+      west:  clickLon - bboxSize,
+      south: clickLat - bboxSize,
+      east:  clickLon + bboxSize,
+      north: clickLat + bboxSize,
     };
 
     try {
       const { detectChange, bboxToGeoJSON } = await import('./utils/api');
-      const geometry = region.geometry || bboxToGeoJSON(region.lat, region.lon, bboxSize);
-      const results = await detectChange(region.lat, region.lon, region.name, bboxSize, geometry);
+      // Send exact click coordinates to backend
+      const results = await detectChange(clickLat, clickLon, region.name, bboxSize, bboxToGeoJSON(clickLat, clickLon, bboxSize));
       setAnalysisResults(results);
 
       // Build overlay from backend prediction_image
       const predBbox = results.bbox || bbox;
-      let imageUrl = null;
-      if (results.prediction_image) {
-        imageUrl = `data:image/png;base64,${results.prediction_image}`;
-      } else {
-        // If backend didn't return an image, generate demo overlay
-        imageUrl = generateDemoPredictionImage(region.lat, region.lon);
-      }
+      const imageUrl = results.prediction_image
+        ? `data:image/png;base64,${results.prediction_image}`
+        : generateDemoPredictionImage(clickLat, clickLon);
       const overlay = { imageUrl, bbox: predBbox };
       setPredictionOverlay(overlay);
       setShowPredictionLayer(true);
-
-      // Cache results
       lastAnalyzedRef.current = { key: regionKey, results, overlay };
 
     } catch (err) {
       console.error('Analysis failed — using demo fallback:', err);
-      const seed = Math.abs(Math.sin(region.lat * 127.1 + region.lon * 311.7));
+      const seed = Math.abs(Math.sin(clickLat * 127.1 + clickLon * 311.7));
       const rnd = (base, spread) => parseFloat((base + (seed * spread - spread / 2)).toFixed(1));
       const fallbackResults = {
         success: true,
@@ -175,7 +174,7 @@ export default function App() {
       setAnalysisResults(fallbackResults);
 
       // Generate demo prediction PNG
-      const imageUrl = generateDemoPredictionImage(region.lat, region.lon);
+      const imageUrl = generateDemoPredictionImage(clickLat, clickLon);
       const overlay = { imageUrl, bbox };
       setPredictionOverlay(overlay);
       setShowPredictionLayer(true);
@@ -183,8 +182,7 @@ export default function App() {
 
     } finally {
       setIsAnalyzing(false);
-      // Auto-zoom to the analyzed region
-      viewerRef?.flyTo?.([region.lon, region.lat], 8);
+      viewerRef?.flyTo?.([clickLon, clickLat], 10);
     }
   }, [viewerRef]);
 

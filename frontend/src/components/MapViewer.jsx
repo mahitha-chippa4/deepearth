@@ -104,24 +104,54 @@ export default function MapViewer({
       });
     });
 
-    // Click handler
-    map.on('click', (e) => {
-      const { lat, lng } = e.lngLat;
+    // Click handler — uses exact click coordinates for API calls
+    map.on('click', async (e) => {
+      const lat = +e.lngLat.lat.toFixed(5);
+      const lng = +e.lngLat.lng.toFixed(5);
+
+      // Find nearest pre-defined region for state context (visual highlight only)
       let closest = null;
       let minDist = Infinity;
       for (const region of INDIAN_REGIONS) {
         const d = Math.hypot(lat - region.lat, lng - region.lon);
         if (d < minDist && d < 3.5) { minDist = d; closest = region; }
       }
-      onRegionClick(
-        closest
-          ? { ...closest, clickLat: lat.toFixed(5), clickLon: lng.toFixed(5) }
-          : {
-            name: 'Custom Region', lat: +lat.toFixed(4), lon: +lng.toFixed(4),
-            area: 'N/A', bbox: 0.3, clickLat: lat.toFixed(5), clickLon: lng.toFixed(5)
-          }
-      );
+
+      // Reverse-geocode the exact click point to get a meaningful local name
+      // e.g. "Warangal, Telangana" instead of always "Telangana, India"
+      let displayName = closest ? closest.name : `Region at ${lat.toFixed(3)}°N, ${lng.toFixed(3)}°E`;
+      try {
+        const resp = await fetch(
+          `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=json&zoom=8`,
+          { headers: { 'Accept-Language': 'en' } }
+        );
+        if (resp.ok) {
+          const geo = await resp.json();
+          const addr = geo.address || {};
+          // Build name: district/county + state, e.g. "Warangal, Telangana"
+          const local = addr.county || addr.state_district || addr.city || addr.town || addr.village || '';
+          const state = addr.state || '';
+          if (local && state) displayName = `${local}, ${state}`;
+          else if (state)     displayName = state;
+          else if (geo.display_name) displayName = geo.display_name.split(',').slice(0, 2).join(',').trim();
+        }
+      } catch (_) { /* silently keep fallback name */ }
+
+      onRegionClick({
+        // Exact click coordinates → sent to backend for satellite fetch
+        lat,
+        lon: lng,
+        clickLat: lat,
+        clickLon: lng,
+        // Display info
+        name: displayName,
+        area: closest?.area || 'N/A',
+        bbox: closest?.bbox || 0.3,
+        // State context (for reference only)
+        stateName: closest?.name || null,
+      });
     });
+
 
     map.on('mousemove', () => { map.getCanvas().style.cursor = 'crosshair'; });
 
