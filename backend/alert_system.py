@@ -1,9 +1,11 @@
 """
 DeepEarth V2 — Email Alert System
 Sends Gmail notifications when major environmental changes are detected.
+Also provides alert deduplication and per-region cooldown utilities.
 """
 
 import os
+import time
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -147,6 +149,66 @@ def should_trigger_alert(severity: str, forest_loss_pct: float) -> bool:
     if forest_loss_pct > 30:
         return True
     return False
+
+
+# ── Bug 1: Alert deduplication by region name ──────────────────
+
+def dedup_alert(alerts: list, new_alert: dict, max_alerts: int = 100) -> None:
+    """
+    Insert *new_alert* into *alerts* (mutates in place).
+
+    Dedup key: region name (case-insensitive, stripped).
+    • If an alert for the same region already exists → UPDATE its
+      score, severity, trend, top_issues, and timestamp in-place.
+    • Otherwise → prepend to the list (capped at *max_alerts*).
+    """
+    key = new_alert.get("region", "").strip().lower()
+    for idx, existing in enumerate(alerts):
+        if existing.get("region", "").strip().lower() == key:
+            # Update existing record
+            existing["score"] = new_alert.get("score", existing.get("score"))
+            existing["severity"] = new_alert.get("severity", existing.get("severity"))
+            existing["forest_loss_pct"] = new_alert.get("forest_loss_pct", existing.get("forest_loss_pct"))
+            existing["top_issues"] = new_alert.get("top_issues", existing.get("top_issues"))
+            existing["timestamp"] = new_alert.get("timestamp", existing.get("timestamp"))
+            existing["coordinates"] = new_alert.get("coordinates", existing.get("coordinates"))
+            return
+    # No existing entry — prepend
+    alerts.insert(0, new_alert)
+    if len(alerts) > max_alerts:
+        alerts.pop()
+
+
+# ── Bug 2: Per-region cooldown cache ───────────────────────────
+
+class RegionCooldownCache:
+    """
+    Simple dict-based cache: { region_key: (timestamp, result) }.
+    Returns cached result if the same region was processed within
+    *cooldown_secs* seconds.
+    """
+
+    def __init__(self, cooldown_secs: int = 60):
+        self._store: dict = {}       # region_key → (float_ts, result)
+        self._cooldown = cooldown_secs
+
+    def get(self, region_name: str):
+        """Return cached result or None if expired / not found."""
+        key = region_name.strip().lower()
+        entry = self._store.get(key)
+        if entry is None:
+            return None
+        cached_ts, cached_result = entry
+        if time.time() - cached_ts < self._cooldown:
+            return cached_result
+        # Expired
+        del self._store[key]
+        return None
+
+    def put(self, region_name: str, result):
+        """Store a result with the current timestamp."""
+        key = region_name.strip().lower()
+        self._store[key] = (time.time(), result)
 
 
 def _severity_icon(pct: float) -> str:

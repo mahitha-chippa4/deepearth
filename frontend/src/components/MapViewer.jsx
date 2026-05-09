@@ -1,6 +1,8 @@
 import React, { useEffect, useRef } from 'react';
 import maplibregl from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
+import MapboxDraw from '@mapbox/mapbox-gl-draw';
+import '@mapbox/mapbox-gl-draw/dist/mapbox-gl-draw.css';
 
 /*
  * MAP ENGINE: MapLibre GL JS v5
@@ -39,7 +41,10 @@ const INDIAN_REGIONS = [
 const PREDICTION_SOURCE = 'ai-prediction-src';
 const PREDICTION_LAYER = 'ai-prediction-layer';
 const GRADCAM_SOURCE = 'gradcam-src';
-const GRADCAM_LAYER  = 'gradcam-layer';
+const GRADCAM_LAYER = 'gradcam-layer';
+const POLYGON_OUTLINE_SOURCE = 'drawn-polygon-src';
+const POLYGON_OUTLINE_LAYER  = 'drawn-polygon-outline';
+const POLYGON_FILL_LAYER     = 'drawn-polygon-fill';
 
 export default function MapViewer({
   onRegionClick,
@@ -47,8 +52,12 @@ export default function MapViewer({
   onViewerReady,
   predictionOverlay,
   showPredictionLayer,
-  gradcamOverlay,       // { imageUrl, bbox } | null
-  showGradcam,         // boolean
+  gradcamOverlay,
+  showGradcam,
+  onDrawCreate,
+  onDrawDelete,
+  onDrawModeChange,
+  drawnPolygon,    // GeoJSON geometry | null — drawn polygon to outline
 }) {
   const containerRef = useRef(null);
   const mapRef = useRef(null);
@@ -108,12 +117,70 @@ export default function MapViewer({
       });
     });
 
-    // Click handler — uses exact click coordinates for API calls
+    // ── MapboxDraw control ──────────────────────────────────────────────
+    // Instantiate BEFORE the click handler so the guard below works.
+    const draw = new MapboxDraw({
+      displayControlsDefault: false,
+      controls: {},
+      defaultMode: 'simple_select',
+      styles: [
+        // ── Polygon ─────────────────────────────────────────────────────
+        // Completed + in-progress polygon fill
+        { id: 'gl-draw-polygon-fill-inactive',
+          type: 'fill',
+          filter: ['all', ['==', 'active', 'false'], ['==', '$type', 'Polygon'], ['!=', 'mode', 'static']],
+          paint: { 'fill-color': '#1976d2', 'fill-outline-color': '#1565c0', 'fill-opacity': 0.15 } },
+        { id: 'gl-draw-polygon-fill-active',
+          type: 'fill',
+          filter: ['all', ['==', 'active', 'true'], ['==', '$type', 'Polygon']],
+          paint: { 'fill-color': '#1976d2', 'fill-outline-color': '#1565c0', 'fill-opacity': 0.12 } },
+        // Polygon stroke — inactive
+        { id: 'gl-draw-polygon-stroke-inactive',
+          type: 'line',
+          filter: ['all', ['==', 'active', 'false'], ['==', '$type', 'Polygon'], ['!=', 'mode', 'static']],
+          paint: { 'line-color': '#1565c0', 'line-width': 2, 'line-dasharray': [4, 2] } },
+        // Polygon stroke — active (solid blue while drawing)
+        { id: 'gl-draw-polygon-stroke-active',
+          type: 'line',
+          filter: ['all', ['==', 'active', 'true'], ['==', '$type', 'Polygon']],
+          paint: { 'line-color': '#1565c0', 'line-width': 2.5 } },
+        // ── Live drawing line (from last point to cursor) ──────────────
+        { id: 'gl-draw-line-active',
+          type: 'line',
+          filter: ['all', ['==', '$type', 'LineString'], ['==', 'active', 'true']],
+          paint: { 'line-color': '#1565c0', 'line-width': 2.5, 'line-dasharray': [2, 2] } },
+        // ── Vertices ─────────────────────────────────────────────────────
+        // White halo on all vertex points
+        { id: 'gl-draw-point-stroke-active',
+          type: 'circle',
+          filter: ['all', ['==', '$type', 'Point'], ['==', 'active', 'true'], ['!=', 'meta', 'midpoint']],
+          paint: { 'circle-radius': 8, 'circle-color': '#fff' } },
+        // Blue dot on active vertices
+        { id: 'gl-draw-point-active',
+          type: 'circle',
+          filter: ['all', ['==', '$type', 'Point'], ['!=', 'meta', 'midpoint'], ['==', 'active', 'true']],
+          paint: { 'circle-radius': 6, 'circle-color': '#1976d2', 'circle-stroke-color': '#fff', 'circle-stroke-width': 2 } },
+        // Inactive vertices (after polygon completed)
+        { id: 'gl-draw-point-inactive',
+          type: 'circle',
+          filter: ['all', ['==', '$type', 'Point'], ['==', 'active', 'false'], ['==', 'meta', 'feature']],
+          paint: { 'circle-radius': 5, 'circle-color': '#fff', 'circle-stroke-color': '#1565c0', 'circle-stroke-width': 2 } },
+        // Mid-point drag handles
+        { id: 'gl-draw-midpoint',
+          type: 'circle',
+          filter: ['all', ['==', '$type', 'Point'], ['==', 'meta', 'midpoint']],
+          paint: { 'circle-radius': 4, 'circle-color': '#1976d2', 'circle-stroke-color': '#fff', 'circle-stroke-width': 1.5 } },
+      ],
+    });
+    map.addControl(draw);
+
+    // Click handler — skip entirely when MapboxDraw is capturing points
     map.on('click', async (e) => {
+      if (draw.getMode() === 'draw_polygon') return;  // ← key guard
+
       const lat = +e.lngLat.lat.toFixed(5);
       const lng = +e.lngLat.lng.toFixed(5);
 
-      // Find nearest pre-defined region for state context (visual highlight only)
       let closest = null;
       let minDist = Infinity;
       for (const region of INDIAN_REGIONS) {
@@ -121,8 +188,6 @@ export default function MapViewer({
         if (d < minDist && d < 3.5) { minDist = d; closest = region; }
       }
 
-      // Reverse-geocode the exact click point to get a meaningful local name
-      // e.g. "Warangal, Telangana" instead of always "Telangana, India"
       let displayName = closest ? closest.name : `Region at ${lat.toFixed(3)}°N, ${lng.toFixed(3)}°E`;
       try {
         const resp = await fetch(
@@ -132,32 +197,27 @@ export default function MapViewer({
         if (resp.ok) {
           const geo = await resp.json();
           const addr = geo.address || {};
-          // Build name: district/county + state, e.g. "Warangal, Telangana"
           const local = addr.county || addr.state_district || addr.city || addr.town || addr.village || '';
           const state = addr.state || '';
           if (local && state) displayName = `${local}, ${state}`;
-          else if (state)     displayName = state;
+          else if (state) displayName = state;
           else if (geo.display_name) displayName = geo.display_name.split(',').slice(0, 2).join(',').trim();
         }
-      } catch (_) { /* silently keep fallback name */ }
+      } catch (_) { /* keep fallback */ }
 
-      onRegionClick({
-        // Exact click coordinates → sent to backend for satellite fetch
-        lat,
-        lon: lng,
-        clickLat: lat,
-        clickLon: lng,
-        // Display info
-        name: displayName,
-        area: closest?.area || 'N/A',
-        bbox: closest?.bbox || 0.3,
-        // State context (for reference only)
-        stateName: closest?.name || null,
-      });
+      onRegionClick({ lat, lon: lng, clickLat: lat, clickLon: lng,
+        name: displayName, area: closest?.area || 'N/A',
+        bbox: closest?.bbox || 0.3, stateName: closest?.name || null });
     });
 
-
     map.on('mousemove', () => { map.getCanvas().style.cursor = 'crosshair'; });
+
+    map.on('draw.create', (e) => {
+      const validFeatures = e.features.filter(f => f.geometry.type === 'Polygon');
+      if (validFeatures.length) onDrawCreate?.({ type: 'FeatureCollection', features: validFeatures });
+    });
+    map.on('draw.delete', () => onDrawDelete?.());
+    map.on('draw.modechange', (e) => onDrawModeChange?.(e.mode));
 
     mapRef.current = map;
     onViewerReady?.({
@@ -165,10 +225,8 @@ export default function MapViewer({
         zoomIn: () => map.zoomIn({ duration: 300 }),
         zoomOut: () => map.zoomOut({ duration: 300 }),
       },
-      // Expose flyTo so App.jsx can zoom to analyzed region
-      flyTo: (center, zoom = 8) => {
-        map.flyTo({ center, zoom, duration: 1200 });
-      },
+      flyTo: (center, zoom = 8) => { map.flyTo({ center, zoom, duration: 1200 }); },
+      draw,   // expose draw instance so App.jsx can call draw.changeMode() etc.
     });
 
     return () => { map.remove(); mapRef.current = null; };
@@ -232,8 +290,8 @@ export default function MapViewer({
     const map = mapRef.current;
     if (!map || !map.isStyleLoaded?.()) return;
 
-    try { if (map.getLayer(GRADCAM_LAYER))  map.removeLayer(GRADCAM_LAYER);  } catch (_) {}
-    try { if (map.getSource(GRADCAM_SOURCE)) map.removeSource(GRADCAM_SOURCE); } catch (_) {}
+    try { if (map.getLayer(GRADCAM_LAYER)) map.removeLayer(GRADCAM_LAYER); } catch (_) { }
+    try { if (map.getSource(GRADCAM_SOURCE)) map.removeSource(GRADCAM_SOURCE); } catch (_) { }
 
     if (gradcamOverlay && showGradcam) {
       const { imageUrl, bbox } = gradcamOverlay;
@@ -261,6 +319,46 @@ export default function MapViewer({
       });
     }
   }, [gradcamOverlay, showGradcam]);
+
+  // ── Drawn Polygon Outline ────────────────────────────────────────────────
+  // Shows a blue border + light fill over the user's drawn polygon so the
+  // analysis boundary is always visible, independent of the prediction raster.
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !map.isStyleLoaded?.()) return;
+
+    // Remove old outline
+    try { if (map.getLayer(POLYGON_OUTLINE_LAYER)) map.removeLayer(POLYGON_OUTLINE_LAYER); } catch (_) {}
+    try { if (map.getLayer(POLYGON_FILL_LAYER))    map.removeLayer(POLYGON_FILL_LAYER);    } catch (_) {}
+    try { if (map.getSource(POLYGON_OUTLINE_SOURCE)) map.removeSource(POLYGON_OUTLINE_SOURCE); } catch (_) {}
+
+    if (!drawnPolygon) return;
+
+    map.addSource(POLYGON_OUTLINE_SOURCE, {
+      type: 'geojson',
+      data: { type: 'Feature', geometry: drawnPolygon, properties: {} },
+    });
+
+    // Semi-transparent fill
+    map.addLayer({
+      id: POLYGON_FILL_LAYER,
+      type: 'fill',
+      source: POLYGON_OUTLINE_SOURCE,
+      paint: { 'fill-color': '#1976d2', 'fill-opacity': 0.06 },
+    });
+
+    // Solid blue dashed border
+    map.addLayer({
+      id: POLYGON_OUTLINE_LAYER,
+      type: 'line',
+      source: POLYGON_OUTLINE_SOURCE,
+      paint: {
+        'line-color': '#1565c0',
+        'line-width': 2.5,
+        'line-dasharray': [3, 2],
+      },
+    });
+  }, [drawnPolygon]);
 
   return (
     <div

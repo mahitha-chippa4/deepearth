@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { CLASS_NAMES, CLASS_COLORS, SEVERITY_CONFIG } from '../utils/constants';
+import InsightsModal from './InsightsModal';
 
 const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
@@ -34,6 +35,7 @@ export default function AnalysisResults({
   const [sendingEmail, setSendingEmail] = useState(false);
   const [emailSent, setEmailSent] = useState(false);
   const [gradcamOpacity, setGradcamOpacity] = useState(0.7);
+  const [showInsights, setShowInsights] = useState(false);
 
   const animForestLoss = useAnimatedValue(stats?.forest_loss_pct);
   const animUrbanGrowth = useAnimatedValue(stats?.urban_growth_pct);
@@ -72,20 +74,35 @@ export default function AnalysisResults({
     if (explaining) return;
     setExplaining(true); setExplainError(null);
     try {
-      const lat = results.lat ?? ((bbox.north + bbox.south) / 2);
-      const lon = results.lon ?? ((bbox.east + bbox.west) / 2);
+      // lat/lon may be nested under .coordinates (polygon-analysis response)
+      const lat = results.lat
+        ?? results.coordinates?.lat
+        ?? ((bbox.north + bbox.south) / 2);
+      const lon = results.lon
+        ?? results.coordinates?.lon
+        ?? ((bbox.east + bbox.west) / 2);
+
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 90000); // 90s timeout
       const resp = await fetch(`${API_BASE}/explain`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ lat, lon, bbox_size: 0.3, region_name: region }),
+        signal: ctrl.signal,
       });
-      if (!resp.ok) throw new Error(`Server ${resp.status}`);
+      clearTimeout(timer);
+
+      if (!resp.ok) {
+        const detail = await resp.json().catch(() => ({}));
+        throw new Error(detail?.detail || `Server ${resp.status}`);
+      }
       const data = await resp.json();
       if (data.explanation_map) {
         onExplain?.(`data:image/png;base64,${data.explanation_map}`);
       } else throw new Error('No heatmap returned');
     } catch (err) {
+      const msg = err.name === 'AbortError' ? 'Timed out — GEE is slow, try again.' : err.message;
       console.error('Explain AI failed:', err);
-      setExplainError('Could not generate explanation. Try again.');
+      setExplainError(msg);
     } finally { setExplaining(false); }
   };
 
@@ -120,6 +137,7 @@ export default function AnalysisResults({
   };
 
   return (
+    <>
     <div className="absolute top-4 left-4 w-[310px] max-h-[calc(100vh-120px)] z-20 animate-slide-in">
       <div className="organic-card overflow-hidden flex flex-col max-h-full">
         {/* Top accent */}
@@ -136,6 +154,39 @@ export default function AnalysisResults({
             <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg>
           </button>
         </div>
+
+        {/* Latest Satellite Data Timestamp */}
+        {(() => {
+          const imgDate = results.data_source?.imagery_date;
+          if (!imgDate || imgDate === 'Data unavailable') {
+            return (
+              <div className="px-4 py-1.5 border-b border-paradise-border bg-amber-50/50 shrink-0">
+                <p className="text-[10px] text-amber-600 flex items-center gap-1.5">
+                  <span className="inline-block w-1.5 h-1.5 rounded-full bg-amber-400" />
+                  Imagery date unavailable
+                </p>
+              </div>
+            );
+          }
+          const d = new Date(imgDate + 'T00:00:00');
+          const formatted = d.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
+          const daysAgo = Math.floor((Date.now() - d.getTime()) / 86400000);
+          const relative = daysAgo === 0 ? 'today' : daysAgo === 1 ? 'yesterday' : `${daysAgo} days ago`;
+          return (
+            <div className="px-4 py-1.5 border-b border-paradise-border bg-emerald-50/40 shrink-0"
+              title="Satellite imagery updates every 5–15 days depending on cloud cover and orbital revisit cycle."
+            >
+              <p className="text-[10px] text-emerald-700 flex items-center gap-1.5 font-medium">
+                <span className="relative flex h-2 w-2">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
+                  <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500" />
+                </span>
+                Latest Data: {formatted}
+                <span className="text-emerald-500/70 font-normal ml-auto">({relative})</span>
+              </p>
+            </div>
+          );
+        })()}
 
         {/* Severity Badge */}
         <div className={`mx-4 mt-3 py-3 px-4 rounded-2xl flex items-center gap-3 ${pulseClass}`}
@@ -161,21 +212,33 @@ export default function AnalysisResults({
             detected issues
           </h4>
           <div className="space-y-2.5 mb-4">
-            {stats.top_issues?.map((issue, i) => (
-              <div key={i} className="flex items-center gap-2">
-                <span className="w-2.5 h-2.5 rounded-full shrink-0" style={{ backgroundColor: CLASS_COLORS[CLASS_NAMES.indexOf(issue.class_name)] || '#999' }} />
-                <div className="flex-1 min-w-0">
-                  <div className="flex items-center justify-between">
-                    <span className="text-[11px] text-paradise-text truncate">{issue.class_name}</span>
-                    <span className="text-[11px] font-semibold text-paradise-dark ml-2">{issue.percentage.toFixed(1)}%</span>
+            {(() => {
+              const maxPct = Math.max(...(stats.top_issues?.map(i => i.percentage) ?? [1]), 1);
+              return stats.top_issues?.map((issue, i) => {
+                const barWidth = `${((issue.percentage / maxPct) * 100).toFixed(2)}%`;
+                const barColor = CLASS_COLORS[CLASS_NAMES.indexOf(issue.class_name)] || '#999';
+                return (
+                  <div key={i} style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <span style={{ width: 10, height: 10, borderRadius: '50%', flexShrink: 0, backgroundColor: barColor, display: 'inline-block' }} />
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                        <span className="text-[11px] text-paradise-text truncate">{issue.class_name}</span>
+                        <span className="text-[11px] font-semibold text-paradise-dark" style={{ marginLeft: 8 }}>{issue.percentage.toFixed(1)}%</span>
+                      </div>
+                      <div style={{ width: '100%', height: 6, backgroundColor: '#e8e4dc', borderRadius: 999, marginTop: 4, overflow: 'hidden' }}>
+                        <div style={{
+                          height: '100%',
+                          width: barWidth,
+                          backgroundColor: barColor,
+                          borderRadius: 999,
+                          transition: 'width 0.7s ease-out',
+                        }} />
+                      </div>
+                    </div>
                   </div>
-                  <div className="w-full h-1.5 bg-paradise-sand rounded-full mt-1 overflow-hidden">
-                    <div className="h-full rounded-full transition-all duration-700 ease-out"
-                      style={{ width: `${Math.min(issue.percentage * 5, 100)}%`, backgroundColor: CLASS_COLORS[CLASS_NAMES.indexOf(issue.class_name)] || '#999' }} />
-                  </div>
-                </div>
-              </div>
-            ))}
+                );
+              });
+            })()}
           </div>
 
           <h4 className="text-[11px] font-bold text-paradise-dark mb-2 uppercase tracking-[0.1em] font-display">
@@ -239,6 +302,12 @@ export default function AnalysisResults({
             {explaining ? <>⏳ generating…</> : showExplanation ? <>🔵 explanation active</> : <>🧠 explain ai</>}
           </button>
 
+          <button id="btn-insights" onClick={() => setShowInsights(true)}
+            className="w-full py-2.5 text-[11px] font-bold rounded-full tracking-[0.08em] uppercase transition-all duration-300 flex items-center justify-center gap-1.5
+              bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-600 hover:to-orange-600 text-white shadow-organic hover:shadow-organic-md hover:-translate-y-0.5">
+            🔮 show prediction & reforms
+          </button>
+
           {(stats.severity === 'HIGH' || stats.severity === 'CRITICAL') && (
             <button id="btn-send-alert" onClick={handleSendAlert} disabled={sendingEmail}
               className={`w-full py-2.5 text-[11px] font-bold rounded-full tracking-[0.08em] uppercase transition-all duration-300 flex items-center justify-center gap-1.5
@@ -270,6 +339,13 @@ export default function AnalysisResults({
         </div>
       </div>
     </div>
+    <InsightsModal
+      isOpen={showInsights}
+      onClose={() => setShowInsights(false)}
+      regionName={region}
+      stats={stats}
+    />
+    </>
   );
 }
 

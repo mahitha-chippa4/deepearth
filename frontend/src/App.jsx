@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useRef } from 'react';
+import React, { useState, useCallback, useRef, useEffect } from 'react';
 import TopNavbar from './components/TopNavbar';
 import Sidebar from './components/Sidebar';
 import MapViewer from './components/MapViewer';
@@ -6,7 +6,10 @@ import AnalysisPanel from './components/AnalysisPanel';
 import RegionPopup from './components/RegionPopup';
 import MapControls from './components/MapControls';
 import AnalysisResults from './components/AnalysisResults';
+import AnalysisLoader from './components/AnalysisLoader';
 import Dashboard from './components/Dashboard';
+import DrawToolbar from './components/DrawToolbar';
+import TimelineSlider from './components/TimelineSlider';
 
 /*
  * CLASS_COLORS used to generate a demo prediction PNG canvas
@@ -88,15 +91,84 @@ export default function App() {
   const [gradcamOverlay, setGradcamOverlay] = useState(null);
   const [showGradcam, setShowGradcam] = useState(false);
 
+  // Loader overlay lifecycle
+  const [analysisRegionName, setAnalysisRegionName] = useState('');
+  const [showLoader, setShowLoader] = useState(false);
+  const [loaderComplete, setLoaderComplete] = useState(false);
+
   // Cache: skip re-analysis if same region is clicked again
   const lastAnalyzedRef = useRef(null);
+
+  // Bug 3: Debounce timer + in-flight guard
+  const analyzeTimerRef = useRef(null);
+  const inFlightRef = useRef(new Set());
+
+  // ── Polygon draw state ────────────────────────────────────────────────
+  const [isDrawing, setIsDrawing] = useState(false);
+  const [drawnPolygon, setDrawnPolygon] = useState(null); // GeoJSON geometry
+  const [isAnalyzingPolygon, setIsAnalyzingPolygon] = useState(false);
+
+  // ── Timeline / time-lapse state ─────────────────────────────
+  const [timelineYear, setTimelineYear] = useState('latest');
+  const [timelineLoading, setTimelineLoading] = useState(false);
+  const [timelineImageryDate, setTimelineImageryDate] = useState(null);
+  // Debounce timer for timeline slider
+  const timelineTimerRef = useRef(null);
 
   const handleRegionClick = useCallback((region) => {
     setSelectedRegion(region);
     setAnalysisResults(null);
   }, []);
 
-  const handleAnalyze = useCallback(async (region) => {
+  const handleTimelineYear = useCallback((year) => {
+    // Need coordinates from the last analysis
+    const coords = analysisResults?.coordinates;
+    if (!coords) return;
+
+    setTimelineYear(year);
+
+    // SPEED: 400ms debounce — rapid slider drags only fire one request
+    if (timelineTimerRef.current) clearTimeout(timelineTimerRef.current);
+    timelineTimerRef.current = setTimeout(async () => {
+      setTimelineLoading(true);
+      setTimelineImageryDate(null);
+
+      try {
+        const { predictYear, bboxToGeoJSON } = await import('./utils/api');
+        const regionName = analysisResults?.region || 'Region';
+        const bboxSize = 0.3;
+        const data = await predictYear(
+          coords.lat, coords.lon, year, regionName, bboxSize,
+          bboxToGeoJSON(coords.lat, coords.lon, bboxSize),
+        );
+
+        // Update overlay
+        if (data.prediction_image) {
+          const imageUrl = `data:image/png;base64,${data.prediction_image}`;
+          const bbox = data.bbox || analysisResults.bbox;
+          setPredictionOverlay({ imageUrl, bbox });
+          setShowPredictionLayer(true);
+        }
+
+        // Update stats in results panel
+        setAnalysisResults(prev => ({
+          ...prev,
+          stats: data.stats,
+          data_source: data.data_source,
+          timestamp: data.timestamp,
+        }));
+
+        setTimelineImageryDate(data.data_source?.imagery_date || null);
+
+      } catch (err) {
+        console.error('Timeline year prediction failed:', err);
+      } finally {
+        setTimelineLoading(false);
+      }
+    }, 400);
+  }, [analysisResults]);
+
+  const _doAnalyze = useCallback(async (region) => {
     // Use the EXACT click coordinates — not the region centroid.
     // This ensures different clicks within the same state produce different predictions
     // because the backend fetches satellite data for the exact location.
@@ -114,8 +186,16 @@ export default function App() {
       return;
     }
 
+    // Bug 3: In-flight guard — skip if this region is already being analyzed
+    const flightKey = (region.name || regionKey).trim().toLowerCase();
+    if (inFlightRef.current.has(flightKey)) return;
+    inFlightRef.current.add(flightKey);
+
     setIsAnalyzing(true);
     setSelectedRegion(null);
+    setAnalysisRegionName(region.name || 'Region');
+    setShowLoader(true);
+    setLoaderComplete(false);
 
     const bboxSize = 0.3;   // fixed 0.3° window around each click
     const bbox = {
@@ -186,9 +266,22 @@ export default function App() {
 
     } finally {
       setIsAnalyzing(false);
+      inFlightRef.current.delete(flightKey);
+      // Signal loader completion → it will animate to 100%, then fade out
+      setLoaderComplete(true);
+      // Hide loader after fade-out animation completes
+      setTimeout(() => setShowLoader(false), 1100);
       viewerRef?.flyTo?.([clickLon, clickLat], 10);
     }
   }, [viewerRef]);
+
+  // SPEED: Reduced debounce 2000ms → 300ms so Analyze responds nearly instantly
+  const handleAnalyze = useCallback((region) => {
+    if (analyzeTimerRef.current) clearTimeout(analyzeTimerRef.current);
+    analyzeTimerRef.current = setTimeout(() => {
+      _doAnalyze(region);
+    }, 300);
+  }, [_doAnalyze]);
 
   const handleZoomIn = useCallback(() => {
     viewerRef?.camera?.zoomIn();
@@ -224,6 +317,89 @@ export default function App() {
     lastAnalyzedRef.current = null;
   }, []);
 
+  // ── Polygon draw handlers ──────────────────────────────────────────────
+  const handleDrawCreate = useCallback((featureCollection) => {
+    // Take the first polygon's geometry
+    const geom = featureCollection.features[0]?.geometry;
+    if (geom) {
+      setDrawnPolygon(geom);
+      setIsDrawing(false);
+    }
+  }, []);
+
+  const handleDrawDelete = useCallback(() => {
+    setDrawnPolygon(null);
+    setIsDrawing(false);
+  }, []);
+
+  const handleDrawModeChange = useCallback((mode) => {
+    setIsDrawing(mode === 'draw_polygon');
+  }, []);
+
+  const handleToggleDraw = useCallback(() => {
+    const draw = viewerRef?.draw;
+    if (!draw) return;
+    if (isDrawing) {
+      draw.changeMode('simple_select');
+      setIsDrawing(false);
+    } else {
+      // Clear any existing polygon first
+      draw.deleteAll();
+      setDrawnPolygon(null);
+      draw.changeMode('draw_polygon');
+      setIsDrawing(true);
+    }
+  }, [viewerRef, isDrawing]);
+
+  const handleClearPolygon = useCallback(() => {
+    const draw = viewerRef?.draw;
+    draw?.deleteAll();
+    setDrawnPolygon(null);
+    setIsDrawing(false);
+    // Also clear overlay so the panel resets
+    handleClearOverlay();
+  }, [viewerRef, handleClearOverlay]);
+
+  const handleAnalyzePolygon = useCallback(async () => {
+    if (!drawnPolygon || isAnalyzingPolygon) return;
+    setIsAnalyzingPolygon(true);
+    setAnalysisRegionName('Custom Region');
+    setShowLoader(true);
+    setLoaderComplete(false);
+    setAnalysisResults(null);
+
+    try {
+      const { analyzePolygon } = await import('./utils/api');
+      const results = await analyzePolygon(drawnPolygon, 'Custom Region');
+      setAnalysisResults(results);
+
+      // Build overlay from backend image + polygon bounding box
+      const coords = drawnPolygon.coordinates[0];
+      const lons = coords.map(c => c[0]);
+      const lats = coords.map(c => c[1]);
+      const bbox = { west: Math.min(...lons), east: Math.max(...lons), south: Math.min(...lats), north: Math.max(...lats) };
+      const predBbox = results.bbox || bbox;
+      const imageUrl = results.prediction_image
+        ? `data:image/png;base64,${results.prediction_image}`
+        : generateDemoPredictionImage((predBbox.north + predBbox.south) / 2, (predBbox.east + predBbox.west) / 2);
+      setPredictionOverlay({ imageUrl, bbox: predBbox });
+      setShowPredictionLayer(true);
+
+      // Fly to polygon centroid
+      const cLat = (predBbox.north + predBbox.south) / 2;
+      const cLon = (predBbox.east + predBbox.west) / 2;
+      viewerRef?.flyTo?.([cLon, cLat], 10);
+    } catch (err) {
+      const detail = err?.response?.data?.detail || err?.message || 'Unknown error';
+      console.error('Polygon analysis failed:', detail, err);
+      alert(`Analysis failed: ${detail}`);
+    } finally {
+      setIsAnalyzingPolygon(false);
+      setLoaderComplete(true);
+      setTimeout(() => setShowLoader(false), 1100);
+    }
+  }, [drawnPolygon, isAnalyzingPolygon, viewerRef]);
+
   if (activePage === 'dashboard') {
     return (
       <div className="h-screen flex flex-col bg-paradise-bg">
@@ -248,6 +424,10 @@ export default function App() {
             showPredictionLayer={showPredictionLayer}
             gradcamOverlay={gradcamOverlay}
             showGradcam={showGradcam}
+            onDrawCreate={handleDrawCreate}
+            onDrawDelete={handleDrawDelete}
+            onDrawModeChange={handleDrawModeChange}
+            drawnPolygon={drawnPolygon}
           />
 
           {/* Analysis Panel */}
@@ -268,19 +448,48 @@ export default function App() {
             />
           )}
 
+          {/* Analysis Loader Overlay */}
+          <AnalysisLoader
+            regionName={analysisRegionName}
+            isVisible={showLoader}
+            isComplete={loaderComplete}
+          />
+
           {/* Analysis Results */}
           {analysisResults && (
-            <AnalysisResults
-              results={analysisResults}
-              onClose={handleClearOverlay}
-              onExplain={handleExplain}
-              showExplanation={showGradcam}
-              onToggleExplanation={() => setShowGradcam(p => !p)}
-            />
+            <div className="animate-results-enter">
+              <AnalysisResults
+                results={analysisResults}
+                onClose={handleClearOverlay}
+                onExplain={handleExplain}
+                showExplanation={showGradcam}
+                onToggleExplanation={() => setShowGradcam(p => !p)}
+              />
+            </div>
           )}
 
           {/* Map Controls */}
           <MapControls onZoomIn={handleZoomIn} onZoomOut={handleZoomOut} />
+
+          {/* Draw Toolbar */}
+          <DrawToolbar
+            isDrawing={isDrawing}
+            hasPolygon={!!drawnPolygon}
+            isAnalyzing={isAnalyzingPolygon}
+            onToggleDraw={handleToggleDraw}
+            onAnalyze={handleAnalyzePolygon}
+            onClear={handleClearPolygon}
+          />
+
+          {/* Timeline Slider — shown when analysis is active */}
+          {analysisResults?.coordinates && (
+            <TimelineSlider
+              onYearChange={handleTimelineYear}
+              activeYear={timelineYear}
+              loading={timelineLoading}
+              imageryDate={timelineImageryDate || analysisResults?.data_source?.imagery_date}
+            />
+          )}
 
           {/* Footer */}
           <div className="map-footer">

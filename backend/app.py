@@ -33,7 +33,12 @@ from .satellite_fetcher import (
     initialize_ee,
 )
 from .change_detection import compute_region_stats, compare_predictions
-from .alert_system import send_alert_email, should_trigger_alert
+from .alert_system import (
+    send_alert_email,
+    should_trigger_alert,
+    dedup_alert,
+    RegionCooldownCache,
+)
 from .utils import CLASS_NAMES, CLASS_COLORS, colorize_prediction
 
 # ── App Setup ─────────────────────────────────────────────────
@@ -55,6 +60,37 @@ app.add_middleware(
 predictor: Optional[DeepEarthPredictor] = None
 ee_initialized = False
 recent_alerts = []
+
+# ── Per-region cooldown (60s) via alert_system helper ──────────
+_region_cache = RegionCooldownCache(cooldown_secs=60)
+
+# ── LRU / TTL cache for /predict-year ──────────────────────────
+# Keyed by (lat_r, lon_r, year) where lat_r/lon_r are rounded to 3dp.
+# TTL = 300 seconds (5 minutes). Stores the full JSON-serialisable result.
+import time as _time
+
+_year_cache: dict = {}          # key → (result, expire_at)
+_YEAR_CACHE_TTL = 300           # seconds
+
+
+def _year_cache_get(key: tuple):
+    """Return cached result or None if missing / expired."""
+    entry = _year_cache.get(key)
+    if entry and _time.monotonic() < entry[1]:
+        return entry[0]
+    _year_cache.pop(key, None)
+    return None
+
+
+def _year_cache_put(key: tuple, value):
+    """Store result with TTL expiry."""
+    _year_cache[key] = (value, _time.monotonic() + _YEAR_CACHE_TTL)
+    # Evict stale entries if cache grows large
+    if len(_year_cache) > 200:
+        now = _time.monotonic()
+        stale = [k for k, (_, exp) in _year_cache.items() if exp < now]
+        for k in stale:
+            _year_cache.pop(k, None)
 
 
 @app.on_event("startup")
@@ -137,10 +173,10 @@ async def predict(req: PredictRequest):
 
     try:
         if req.model_type == "temporal":
-            features = fetch_temporal_features(req.lat, req.lon, req.bbox_size, geometry=geom)
+            features, data_meta = fetch_temporal_features(req.lat, req.lon, req.bbox_size, geometry=geom)
             pred_map = predictor.predict_temporal(features)
         else:
-            features = fetch_static_features(req.lat, req.lon, req.bbox_size, geometry=geom)
+            features, data_meta = fetch_static_features(req.lat, req.lon, req.bbox_size, geometry=geom)
             pred_map = predictor.predict_static(features)
 
         stats = compute_region_stats(pred_map)
@@ -152,11 +188,92 @@ async def predict(req: PredictRequest):
             "model_type": req.model_type,
             "stats": stats,
             "prediction_image": pred_image,
+            "data_source": data_meta,
             "timestamp": datetime.now().isoformat(),
         }
     except Exception as e:
         raise HTTPException(500, f"Prediction failed: {str(e)}")
 
+
+class PredictYearRequest(BaseModel):
+    """Predict for a specific year (time-lapse slider)."""
+    lat: float
+    lon: float
+    bbox_size: float = 0.3
+    year: str = "latest"   # "2019", "2021", "2023", "2024", or "latest"
+    region_name: str = "Unknown Region"
+    geometry: Optional[GeoJSONGeometry] = None
+
+
+@app.post("/predict-year")
+async def predict_year(req: PredictYearRequest):
+    """
+    Time-lapse endpoint: run prediction for a single target year.
+    Fetches baseline (2019) + target year indices → 12-channel stack → UNet.
+    Supports 'latest' for most-recent satellite data.
+
+    SPEED: Results are cached by (lat, lon, year) for 5 minutes so that
+    dragging the timeline slider back to the same year returns instantly.
+    """
+    if predictor is None:
+        raise HTTPException(500, "Models not loaded")
+
+    from .satellite_fetcher import fetch_spectral_indices
+    from .utils import BASELINE_YEAR
+
+    geom = req.geometry.dict() if req.geometry else None
+    year_arg = "latest" if req.year.lower() == "latest" else int(req.year)
+
+    # ── Cache lookup ────────────────────────────────────────────────────────
+    cache_key = (round(req.lat, 3), round(req.lon, 3), req.year)
+    cached = _year_cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        # Always pair with baseline 2019 to get the 12-ch stack
+        arr_base, bl_label, bl_date = fetch_spectral_indices(
+            req.lat, req.lon, BASELINE_YEAR, req.bbox_size, geometry=geom,
+        )
+        arr_target, tgt_label, tgt_date = fetch_spectral_indices(
+            req.lat, req.lon, year_arg, req.bbox_size, geometry=geom,
+        )
+
+        H = min(arr_base.shape[0], arr_target.shape[0])
+        W = min(arr_base.shape[1], arr_target.shape[1])
+        features = np.concatenate([arr_base[:H, :W, :], arr_target[:H, :W, :]], axis=-1)
+
+        pred_map = predictor.predict_static(features)
+        stats = compute_region_stats(pred_map)
+        pred_image = _encode_prediction_image(pred_map)
+
+        result = {
+            "success": True,
+            "year": req.year,
+            "year_label": f"Latest ({tgt_label})" if req.year.lower() == "latest" else req.year,
+            "coordinates": {"lat": req.lat, "lon": req.lon},
+            "bbox": {
+                "west":  req.lon - req.bbox_size,
+                "south": req.lat - req.bbox_size,
+                "east":  req.lon + req.bbox_size,
+                "north": req.lat + req.bbox_size,
+            },
+            "stats": stats,
+            "prediction_image": pred_image,
+            "data_source": {
+                "baseline_year": BASELINE_YEAR,
+                "target_year": req.year,
+                "target_label": tgt_label,
+                "imagery_date": tgt_date or "Data unavailable",
+            },
+            "timestamp": datetime.now().isoformat(),
+        }
+
+        # ── Cache the result ────────────────────────────────────────────────
+        _year_cache_put(cache_key, result)
+        return result
+    except Exception as e:
+        raise HTTPException(500, f"Year prediction failed: {str(e)}")
 
 @app.post("/detect-change")
 async def detect_change(req: ChangeDetectRequest):
@@ -168,11 +285,16 @@ async def detect_change(req: ChangeDetectRequest):
     if predictor is None:
         raise HTTPException(500, "Models not loaded")
 
+    # ── Bug 2: Per-region cooldown lock ────────────────────────
+    cached = _region_cache.get(req.region_name)
+    if cached is not None:
+        return cached
+
     # Convert geometry pydantic model → plain dict for GEE / mock
     geom = req.geometry.dict() if req.geometry else None
 
     try:
-        features = fetch_static_features(req.lat, req.lon, req.bbox_size, geometry=geom)
+        features, data_meta = fetch_static_features(req.lat, req.lon, req.bbox_size, geometry=geom)
         pred_map  = predictor.predict_static(features)
         stats     = compute_region_stats(pred_map)
 
@@ -186,9 +308,9 @@ async def detect_change(req: ChangeDetectRequest):
                 "timestamp": datetime.now().isoformat(),
                 "coordinates": {"lat": req.lat, "lon": req.lon},
             }
-            recent_alerts.insert(0, alert)
-            if len(recent_alerts) > 100:
-                recent_alerts.pop()
+
+            # ── Bug 1: Dedup by region name ────────────────────
+            dedup_alert(recent_alerts, alert)
 
             send_alert_email(
                 region_name=req.region_name,
@@ -201,7 +323,7 @@ async def detect_change(req: ChangeDetectRequest):
 
         pred_image = _encode_prediction_image(pred_map)
 
-        return {
+        result = {
             "success": True,
             "region": req.region_name,
             "coordinates": {"lat": req.lat, "lon": req.lon},
@@ -216,8 +338,14 @@ async def detect_change(req: ChangeDetectRequest):
             "alert_triggered": should_trigger_alert(
                 stats["severity"], stats["forest_loss_pct"]
             ),
+            "data_source": data_meta,
             "timestamp": datetime.now().isoformat(),
         }
+
+        # ── Bug 2: Store in cooldown cache ─────────────────────
+        _region_cache.put(req.region_name, result)
+
+        return result
     except Exception as e:
         raise HTTPException(500, f"Change detection failed: {str(e)}")
 
@@ -226,44 +354,67 @@ async def detect_change(req: ChangeDetectRequest):
 async def analyze_polygon(req: AnalyzePolygonRequest):
     """
     Analyze an arbitrary GeoJSON polygon drawn by the user.
-    Computes centroid automatically if lat/lon not provided.
+    Computes centroid and bbox automatically from the coordinates.
+    Returns a PNG masked to the polygon shape (transparent outside).
     """
     if predictor is None:
         raise HTTPException(500, "Models not loaded")
 
     geom = req.geometry.dict()
 
-    # Extract centroid from polygon coordinates if not provided
+    # Compute centroid + actual bbox from polygon ring
     lat, lon = req.lat, req.lon
+    coords = req.geometry.coordinates[0]  # outer ring [[lon, lat], ...]
+    poly_lons = [c[0] for c in coords]
+    poly_lats = [c[1] for c in coords]
     if lat is None or lon is None:
-        coords = req.geometry.coordinates[0]  # outer ring
-        lons = [c[0] for c in coords]
-        lats = [c[1] for c in coords]
-        lon, lat = float(np.mean(lons)), float(np.mean(lats))
+        lon, lat = float(np.mean(poly_lons)), float(np.mean(poly_lats))
+
+    actual_bbox = {
+        "west":  float(min(poly_lons)),
+        "east":  float(max(poly_lons)),
+        "south": float(min(poly_lats)),
+        "north": float(max(poly_lats)),
+    }
 
     try:
-        features = fetch_static_features(lat, lon, geometry=geom)
-        pred_map = predictor.predict_static(features)
-        stats    = compute_region_stats(pred_map)
-        pred_image = _encode_prediction_image(pred_map)
+        features, data_meta = fetch_static_features(lat, lon, geometry=geom)
+        pred_map  = predictor.predict_static(features)
+        stats     = compute_region_stats(pred_map)
+        pred_image = _encode_prediction_masked(pred_map, geom, actual_bbox)
 
-        bbox_size = 0.3
         return {
             "success": True,
             "region": req.region_name,
             "coordinates": {"lat": lat, "lon": lon},
-            "bbox": {
-                "west":  lon - bbox_size,
-                "south": lat - bbox_size,
-                "east":  lon + bbox_size,
-                "north": lat + bbox_size,
-            },
+            "bbox": actual_bbox,
             "stats": stats,
             "prediction_image": pred_image,
+            "data_source": data_meta,
             "timestamp": datetime.now().isoformat(),
         }
     except Exception as e:
         raise HTTPException(500, f"Polygon analysis failed: {str(e)}")
+
+
+class InsightsRequest(BaseModel):
+    """Request AI-generated insights and reforms."""
+    region_name: str = "Unknown Region"
+    current_stats: dict
+
+
+@app.post("/insights")
+async def get_insights(req: InsightsRequest):
+    """Generate AI trend analysis and reform recommendations."""
+    from .insights import generate_insights
+    try:
+        result = generate_insights(
+            region_name=req.region_name,
+            current_stats=req.current_stats,
+        )
+        return {"success": True, **result}
+    except Exception as e:
+        raise HTTPException(500, f"Insights generation failed: {str(e)}")
 
 
 @app.get("/alerts")
@@ -295,7 +446,7 @@ async def get_regions():
 # ── Helpers ───────────────────────────────────────────────────
 
 def _encode_prediction_image(pred_map: np.ndarray) -> str:
-    """Encode prediction map as base64 PNG string."""
+    """Encode prediction map as base64 PNG (RGB, no mask)."""
     try:
         from PIL import Image
         rgb      = colorize_prediction(pred_map)
@@ -306,6 +457,64 @@ def _encode_prediction_image(pred_map: np.ndarray) -> str:
         return base64.b64encode(buffer.getvalue()).decode("utf-8")
     except ImportError:
         return ""
+
+
+def _encode_prediction_masked(
+    pred_map: np.ndarray,
+    geometry: dict,
+    bbox: dict,
+) -> str:
+    """
+    Encode prediction map as RGBA PNG with pixels outside the GeoJSON polygon
+    set to fully transparent. Requires matplotlib (std dependency).
+    Falls back to opaque RGB if matplotlib is unavailable.
+    """
+    try:
+        from PIL import Image
+        from matplotlib.path import Path
+
+        rgb       = colorize_prediction(pred_map)
+        rgb_uint8 = (rgb * 255).astype(np.uint8)
+        H, W      = pred_map.shape
+
+        west   = bbox["west"]
+        east   = bbox["east"]
+        south  = bbox["south"]
+        north  = bbox["north"]
+        lon_span = east  - west  or 1e-6
+        lat_span = north - south or 1e-6
+
+        # Convert polygon ring to pixel space (origin = top-left)
+        ring = geometry["coordinates"][0]
+        px_coords = [
+            (
+                W * (c[0] - west)   / lon_span,
+                H * (north - c[1])  / lat_span,   # y-flip: north → row 0
+            )
+            for c in ring
+        ]
+        path = Path(px_coords)
+
+        # Build pixel-centre grid and test containment
+        xs = np.arange(W) + 0.5
+        ys = np.arange(H) + 0.5
+        xg, yg = np.meshgrid(xs, ys)
+        pts    = np.column_stack([xg.ravel(), yg.ravel()])
+        inside = path.contains_points(pts).reshape(H, W)
+
+        # RGBA: transparent outside polygon
+        alpha  = np.where(inside, 255, 0).astype(np.uint8)
+        rgba   = np.dstack([rgb_uint8, alpha])
+
+        img    = Image.fromarray(rgba, mode="RGBA")
+        buffer = io.BytesIO()
+        img.save(buffer, format="PNG")
+        return base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+    except Exception:
+        # Fallback: return opaque image
+        return _encode_prediction_image(pred_map)
+
 
 
 # ── Explainability ─────────────────────────────────────────────
@@ -320,25 +529,18 @@ class ExplainRequest(BaseModel):
 @app.post("/explain")
 async def explain_prediction(req: ExplainRequest):
     """
-    Generate a Grad-CAM explanation heatmap for the most recent prediction.
-    This runs AFTER prediction and does NOT modify the prediction pipeline.
+    Generate a Grad-CAM explanation heatmap.
+    Reuses the features cached from the most recent predict_static() call —
+    no additional GEE satellite fetch needed.
     """
     if predictor is None:
         raise HTTPException(500, "Models not loaded")
     try:
-        from .satellite_fetcher import fetch_static_features  # already imported above
-        geom = req.geometry or {
-            "type": "Polygon",
-            "coordinates": [[
-                [req.lon - req.bbox_size, req.lat - req.bbox_size],
-                [req.lon + req.bbox_size, req.lat - req.bbox_size],
-                [req.lon + req.bbox_size, req.lat + req.bbox_size],
-                [req.lon - req.bbox_size, req.lat + req.bbox_size],
-                [req.lon - req.bbox_size, req.lat - req.bbox_size],
-            ]],
-        }
-        features = fetch_static_features(req.lat, req.lon, geometry=geom)
-        explanation_map = predictor.generate_explanation(features)
+        # generate_explanation() falls back to predictor._last_features if
+        # no features arg is passed — avoids a redundant GEE call.
+        explanation_map = predictor.generate_explanation()
+        if not explanation_map:
+            raise ValueError("No cached features — run a prediction first.")
         return {
             "success": True,
             "region": req.region_name,
@@ -347,6 +549,7 @@ async def explain_prediction(req: ExplainRequest):
         }
     except Exception as e:
         raise HTTPException(500, f"Explanation failed: {str(e)}")
+
 
 
 # ── Report Generation ──────────────────────────────────────────

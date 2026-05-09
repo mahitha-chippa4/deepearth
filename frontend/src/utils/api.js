@@ -65,8 +65,23 @@ export const analyzePolygon = async (geometry, regionName = 'Custom Region') => 
   return data;
 };
 
-export const getAlerts  = async () => { const { data } = await api.get('/alerts');  return data; };
+export const getAlerts = async () => { const { data } = await api.get('/alerts'); return data; };
 export const getRegions = async () => { const { data } = await api.get('/regions'); return data; };
 export const getClasses = async () => { const { data } = await api.get('/classes'); return data; };
+
+/**
+ * Time-lapse: predict for a specific year (or "latest").
+ */
+export const predictYear = async (lat, lon, year = 'latest', regionName = 'Region', bboxSize = 0.3, geometry = null) => {
+  const { data } = await api.post('/predict-year', {
+    lat,
+    lon,
+    bbox_size: bboxSize,
+    year: String(year),
+    region_name: regionName,
+    geometry: geometry || bboxToGeoJSON(lat, lon, bboxSize),
+  });
+  return data;
+};
 
 export default api;

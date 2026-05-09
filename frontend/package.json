@@ -9,6 +9,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@mapbox/mapbox-gl-draw": "^1.5.1",
     "axios": "^1.6.0",
     "cesium": "^1.114.0",
     "chart.js": "^4.4.0",
@@ -16,7 +17,9 @@
     "maplibre-gl": "^5.20.1",
     "react": "^18.2.0",
     "react-chartjs-2": "^5.2.0",
+    "react-countup": "^6.5.3",
     "react-dom": "^18.2.0",
+    "react-hot-toast": "^2.6.0",
     "react-router-dom": "^7.13.1",
     "resium": "^1.17.0"
   },

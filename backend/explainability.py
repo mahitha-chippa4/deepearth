@@ -14,28 +14,93 @@ logger = logging.getLogger(__name__)
 
 def generate_gradcam(model, input_tensor, target_layer):
     """
-    Generate a Grad-CAM explanation heatmap for a single input patch.
+    Generate a Grad-CAM explanation heatmap for a segmentation model.
+
+    For segmentation models (output shape: 1 × num_classes × H × W), standard
+    GradCAM requires a scalar target.  We use SemanticSegmentationTarget on the
+    dominant predicted class to produce an accurate attention heatmap.
 
     Args:
-        model:        PyTorch model (UNetV3)
-        input_tensor: (1, C, H, W) float32 tensor — MUST have requires_grad=True
+        model:        PyTorch segmentation model (UNetV3)
+        input_tensor: (1, C, H, W) float32 tensor
         target_layer: Module to hook (e.g. model.enc4)
 
     Returns:
-        heatmap: (H, W) float32 ndarray in [0, 1]
-                 Returns None on any error so the prediction pipeline is unaffected.
+        heatmap: (H, W) float32 ndarray in [0, 1], or None on total failure.
     """
     try:
+        import torch
         from pytorch_grad_cam import GradCAM
+        from pytorch_grad_cam.utils.model_targets import SemanticSegmentationTarget
+
+        # ── Step 1: find dominant predicted class (no-grad forward pass) ──
+        with torch.no_grad():
+            logits = model(input_tensor)          # (1, num_classes, H, W)
+        pred_labels = logits.argmax(dim=1).squeeze(0).cpu().numpy()  # (H, W)
+        dominant_cls = int(np.bincount(pred_labels.flatten()).argmax())
+        mask = (pred_labels == dominant_cls).astype(np.float32)       # (H, W)
+
+        # ── Step 2: Grad-CAM with semantic segmentation target ────────────
+        targets = [SemanticSegmentationTarget(dominant_cls, mask)]
         cam = GradCAM(model=model, target_layers=[target_layer])
-        grayscale_cam = cam(input_tensor=input_tensor)   # (1, H, W)
-        heatmap = grayscale_cam[0]                       # (H, W)
-        heatmap = cv2.normalize(heatmap, None, 0, 1, cv2.NORM_MINMAX)
+        grayscale_cam = cam(input_tensor=input_tensor, targets=targets)
+        heatmap = grayscale_cam[0]                                    # (H, W)
+        heatmap = cv2.normalize(heatmap, None, 0, 1, cv2.NORM_MINMAX).astype(np.float32)
         return heatmap
 
     except Exception as exc:
-        logger.warning("Grad-CAM failed — returning synthetic heatmap: %s", exc)
-        # Return a synthetic gradient-style heatmap so the UI always gets something
+        logger.warning("Grad-CAM failed — using manual hooks fallback: %s", exc)
+        return _manual_gradcam(model, input_tensor, target_layer)
+
+
+def _manual_gradcam(model, input_tensor, target_layer) -> np.ndarray:
+    """
+    Pure-PyTorch Grad-CAM fallback for segmentation — no external library needed.
+    Hooks activations and gradients on target_layer, selects the dominant class,
+    then computes weighted activation maps and upsamples to input resolution.
+    """
+    try:
+        import torch
+        activations, gradients = [], []
+
+        fwd = target_layer.register_forward_hook(
+            lambda m, i, o: activations.append(o.detach())
+        )
+        bwd = target_layer.register_full_backward_hook(
+            lambda m, gi, go: gradients.append(go[0].detach())
+        )
+
+        try:
+            model.zero_grad()
+            inp = input_tensor.clone().requires_grad_(True)
+            output = model(inp)                                   # (1, C, H, W)
+            # Dominant class across the patch
+            pred = output.argmax(dim=1).squeeze(0)
+            dominant_cls = int(pred.flatten().mode().values.item())
+            score = output[:, dominant_cls, :, :].sum()
+            score.backward()
+        finally:
+            fwd.remove()
+            bwd.remove()
+
+        acts = activations[0]         # (1, Ch, h, w)
+        grads = gradients[0]          # (1, Ch, h, w)
+        weights = grads.mean(dim=(2, 3), keepdim=True)
+        cam = torch.relu((weights * acts).sum(dim=1)).squeeze(0)  # (h, w)
+
+        _, _, H, W = input_tensor.shape
+        cam_up = torch.nn.functional.interpolate(
+            cam.unsqueeze(0).unsqueeze(0), size=(H, W),
+            mode='bilinear', align_corners=False,
+        ).squeeze().cpu().numpy()
+
+        cam_up = cam_up - cam_up.min()
+        if cam_up.max() > 0:
+            cam_up /= cam_up.max()
+        return cam_up.astype(np.float32)
+
+    except Exception as exc:
+        logger.warning("Manual Grad-CAM also failed — using synthetic: %s", exc)
         return _synthetic_heatmap(input_tensor)
 
 

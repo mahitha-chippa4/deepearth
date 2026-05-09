@@ -3,13 +3,14 @@ DeepEarth V2 — Shared Constants & Utilities
 """
 
 import numpy as np
+from datetime import datetime
 
 # ── 11 Environmental Change Classes ──────────────────────────
 
 NUM_CLASSES = 11
 PATCH_SIZE = 32
 STRIDE = 16
-SCALE = 500  # GEE reproject scale in meters
+SCALE = 30  # GEE reproject scale in meters
 
 CLASS_NAMES = [
     "No Change",
@@ -63,8 +64,21 @@ MANUAL_WEIGHTS = np.array(
 # Spectral bands used
 SPECTRAL_BANDS = ["NDVI", "NDWI", "NDBI", "NBR", "EVI", "MNDWI"]
 
-# Temporal years
-TEMPORAL_YEARS = [2019, 2021, 2023, 2024]
+# ── Dynamic Year Resolution ──────────────────────────────────
+# Baseline year stays fixed; "recent" year is always the current year.
+BASELINE_YEAR = 2019
+
+def get_current_year() -> int:
+    """Return the current calendar year for satellite data queries."""
+    return datetime.now().year
+
+def get_temporal_years() -> list[int]:
+    """4-year temporal stack: baseline, two intermediates, and current."""
+    cy = get_current_year()
+    return [BASELINE_YEAR, BASELINE_YEAR + 2, cy - 1, cy]
+
+# Legacy constant — kept for imports that may reference it
+TEMPORAL_YEARS = get_temporal_years()
 
 
 # ── Label Generation ─────────────────────────────────────────
@@ -95,9 +109,16 @@ def make_labels(arr_2019: np.ndarray, arr_2024: np.ndarray) -> np.ndarray:
     labels[(delta_ndvi < -0.08) & (ndvi_19 > 0.3)] = 3
     labels[(ndbi_24 > 0.1) & (delta_ndvi < -0.05)] = 4
     labels[(ndbi_24 > 0.2) & (delta_ndvi < -0.1)] = 5
-    labels[(ndvi_24 < 0.1) & (delta_ndvi < -0.1)] = 6
-    labels[(ndwi_19 > 0.1) & (ndvi_24 < 0.15)] = 7
-    labels[(delta_ndwi < -0.1) & (ndwi_19 > 0.0)] = 8
+    labels[
+    (ndvi_24 < 0.15) &
+    (ndbi_24 < 0.1) &
+    (delta_ndvi < -0.1) &
+    (delta_ndwi < 0.05)
+    ] = 6
+    # Sand Mining: requires genuine shallow water signature (NDWI > 0.15), not just moist soil
+    labels[(ndwi_19 > 0.15) & (ndvi_24 < 0.15)] = 7
+    # Water Body Shrinkage: requires actual water body (NDWI > 0.2 in 2019) + strong decrease
+    labels[(delta_ndwi < -0.15) & (ndwi_19 > 0.2)] = 8
     labels[delta_nbr < -0.2] = 9
     labels[(delta_ndvi > 0.1) & (ndvi_24 > 0.2)] = 10
 
